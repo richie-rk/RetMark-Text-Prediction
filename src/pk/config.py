@@ -62,6 +62,7 @@ class TrainConfig:
 class CorrectConfig:
     dialect: str
     max_edit_distance: int
+    harper_ls_path: str
 
 
 @dataclass(frozen=True)

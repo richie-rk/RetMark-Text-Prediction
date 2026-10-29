@@ -39,6 +39,7 @@ adam_eps = 1e-8
 [correct]
 dialect = "both"  # accept a word correct in either British or American spelling
 max_edit_distance = 2
+harper_ls_path = ""  # empty: find harper-ls on PATH
 
 [persist]
 checkpoint_interval_s = 300

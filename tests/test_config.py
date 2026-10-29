@@ -37,6 +37,7 @@ def test_shipped_defaults():
     assert cfg.train.adam_eps == 1e-8
     assert cfg.correct.dialect == "both"
     assert cfg.correct.max_edit_distance == 2
+    assert cfg.correct.harper_ls_path == ""
     assert cfg.persist.checkpoint_interval_s == 300
     assert cfg.logs.flush_interval_s == 5
     assert cfg.dictionary.candidate_min_count == 3
