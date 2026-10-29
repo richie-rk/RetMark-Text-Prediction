@@ -459,5 +459,64 @@ def graph_stats(as_json: bool = JSON):
     run(as_json, go)
 
 
+# --- eval / sweep -----------------------------------------------------------------
+
+
+HOLDOUT = typer.Option(..., "--holdout", help="Frozen clean-log JSONL the model was not trained on.")
+
+
+def _holdout(path):
+    from pk import evaluation
+
+    if not Path(path).exists():
+        raise Fail(EXIT_ERROR, f"held-out file not found: {path}")
+    return evaluation.load_sentences(path)
+
+
+@app.command("eval")
+def eval_(holdout: Path = HOLDOUT, as_json: bool = JSON):
+    """Score the saved model on a held-out set without changing it."""
+
+    def go():
+        from pk import evaluation
+        from pk.persistence import load_model
+
+        cfg = config()
+        sentences = _holdout(holdout)
+        m = cfg.model
+        params = load_model(cfg.paths.data_dir, m.d_model, m.mlp_hidden, None) or evaluation.fresh_params(cfg)
+        r = evaluation.evaluate_sentences(params, cfg, sentences)
+        human = (
+            f"{r['sentences']} sentences, {r['tokens']} tokens\n"
+            f"mean cross-entropy {r['mean_ce']:.4f}, perplexity {r['perplexity']:.2f}, top-3 hit rate {r['top3_hit_rate']:.1%}"
+        )
+        return r, human
+
+    run(as_json, go)
+
+
+@app.command()
+def sweep(param: str, values: str, holdout: Path = HOLDOUT, as_json: bool = JSON):
+    """Retrain from the seed once per VALUE of PARAM and score each on the held-out set."""
+
+    def go():
+        from pk import evaluation
+        from pk.config import ConfigError
+
+        cfg = config()
+        sentences = _holdout(holdout)
+        try:
+            section, key, _ = evaluation.resolve_param(cfg, param)
+            rows = evaluation.sweep(cfg, param, [v.strip() for v in values.split(",") if v.strip()], sentences)
+        except (ConfigError, ValueError) as e:
+            raise Fail(EXIT_ERROR, str(e)) from None
+        name = f"{section}.{key}"
+        lines = [f"{name:>28s}  perplexity  top-3 hit rate"]
+        lines += [f"{row['value']!s:>28s}  {row['perplexity']:10.2f}  {row['top3_hit_rate']:14.1%}" for row in rows]
+        return {"param": name, "rows": rows}, "\n".join(lines)
+
+    run(as_json, go)
+
+
 def main():
     app()

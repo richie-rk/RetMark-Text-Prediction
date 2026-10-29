@@ -1,0 +1,14 @@
+{"ts": "2026-09-01T09:00:00.000+05:30", "session": "s1", "source": "cli", "text": "The cat sat on the mat."}
+{"ts": "2026-09-01T09:00:01.000+05:30", "session": "s1", "source": "cli", "text": " The dog sat on the rug."}
+{"ts": "2026-09-01T09:00:02.000+05:30", "session": "s1", "source": "cli", "text": " The cat ran to the door."}
+{"ts": "2026-09-01T09:00:03.000+05:30", "session": "s1", "source": "cli", "text": " The dog ran to the gate."}
+{"ts": "2026-09-01T09:00:04.000+05:30", "session": "s2", "source": "cli", "text": "I like green tea in the morning."}
+{"ts": "2026-09-01T09:00:05.000+05:30", "session": "s2", "source": "cli", "text": " I like black coffee in the evening."}
+{"ts": "2026-09-01T09:00:06.000+05:30", "session": "s2", "source": "cli", "text": " The cat likes warm milk."}
+{"ts": "2026-09-01T09:00:07.000+05:30", "session": "s3", "source": "cli", "text": "We walked to the park after lunch."}
+{"ts": "2026-09-01T09:00:08.000+05:30", "session": "s3", "source": "cli", "text": " The park was quiet and green."}
+{"ts": "2026-09-01T09:00:09.000+05:30", "session": "s3", "source": "cli", "text": " We sat on the old bench."}
+{"ts": "2026-09-01T09:00:10.000+05:30", "session": "s4", "source": "cli", "text": "The dog sat on the mat."}
+{"ts": "2026-09-01T09:00:11.000+05:30", "session": "s4", "source": "cli", "text": " The cat sat on the rug."}
+{"ts": "2026-09-01T09:00:12.000+05:30", "session": "s4", "source": "cli", "text": " I like green tea."}
+{"ts": "2026-09-01T09:00:13.000+05:30", "session": "s4", "source": "cli", "text": " We walked to the gate."}
