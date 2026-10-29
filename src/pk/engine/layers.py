@@ -4,11 +4,16 @@ each backward() takes the upstream gradient and that cache.
 Every function derives its array module from its inputs, so the same code
 runs on NumPy and CuPy.
 """
+import math
+
 import numpy
 
 LN_EPS = 1e-5
 ATTN_EPS = 1e-6
-_GELU_C = numpy.sqrt(2.0 / numpy.pi)
+# A plain float on purpose: under NumPy 2 promotion a numpy.float64 scalar
+# turns float32 activations into float64, and the logits matmul then misses
+# the float32 BLAS path entirely (about 40x slower).
+_GELU_C = math.sqrt(2.0 / math.pi)
 
 
 def array_module(a):

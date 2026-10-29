@@ -206,3 +206,15 @@ def test_elementwise_layers_backward(fn):
 def test_phi_is_elu_plus_one():
     y, _ = layers.phi_forward(np.array([-1.0, 0.0, 2.0]))
     np.testing.assert_allclose(y, [np.exp(-1.0), 1.0, 3.0])
+
+
+def test_float32_survives_step_forward_and_backward():
+    params = init_params(D, H, V, std=0.02, seed=1)
+    s = step(params, zero_state(D), 3, True, FAST, LAM)
+    assert s.logits.dtype == np.float32 and s.S_s.dtype == np.float32
+    inputs, targets, boundaries = sequence()
+    logits, final, cache = forward_sequence(params, inputs, boundaries, zero_state(D), FAST, LAM)
+    assert logits.dtype == np.float32 and final.S_f.dtype == np.float32
+    _, ce = layers.softmax_ce_forward(logits, targets, np.ones(T, dtype=bool))
+    grads = backward_sequence(layers.softmax_ce_backward(ce), cache)
+    assert all(g.dtype == np.float32 for g in grads.values())
