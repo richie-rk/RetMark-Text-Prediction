@@ -39,8 +39,9 @@ def _heads(x):
     return x.reshape(x.shape[:-1] + (2, x.shape[-1] // 2))
 
 
-def step(params, state, token, boundary, fast_decay, boundary_decay):
-    """Advance one token for inference. Returns a new state carrying the logits."""
+def step(params, state, token, boundary, fast_decay, boundary_decay, return_hidden=False):
+    """Advance one token for inference. Returns a new state carrying the logits
+    (and the MLP's post-GELU activations when asked, for inspection)."""
     p = params
     xp = layers.array_module(p["E"])
     x = p["E"][token]
@@ -65,7 +66,8 @@ def step(params, state, token, boundary, fast_decay, boundary_decay):
     logits = nf @ p["E"].T + p["bo"]
     if boundary:
         S_s, z_s, S_f, z_f = (boundary_decay * t for t in (S_s, z_s, S_f, z_f))
-    return RecurrentState(S_s=S_s, z_s=z_s, S_f=S_f, z_f=z_f, logits=logits)
+    new = RecurrentState(S_s=S_s, z_s=z_s, S_f=S_f, z_f=z_f, logits=logits)
+    return (new, g) if return_hidden else new
 
 
 def forward_sequence(params, tokens, boundaries, state0, fast_decay, boundary_decay):
@@ -133,3 +135,16 @@ def backward_sequence(dlogits, cache, cuts=None):
     # The tied embedding collects gradient from both the lookup and the output.
     grads["E"] = dE_out + layers.embedding_backward(dx, c_emb, V)
     return grads
+
+
+def sequence_loss(params, tokens, boundaries, state0, fast_decay, boundary_decay):
+    """Mean next-token cross-entropy over a token sequence, no gradients.
+    Returns (mean loss, number of targets, final state)."""
+    if len(tokens) < 2:
+        return 0.0, 0, state0
+    logits, final, _ = forward_sequence(params, tokens[:-1], boundaries[:-1], state0, fast_decay, boundary_decay)
+    xp = layers.array_module(logits)
+    targets = xp.asarray(tokens[1:])
+    mask = xp.ones(len(tokens) - 1, dtype=bool)
+    loss_sum, _ = layers.softmax_ce_forward(logits, targets, mask)
+    return float(loss_sum) / (len(tokens) - 1), len(tokens) - 1, final

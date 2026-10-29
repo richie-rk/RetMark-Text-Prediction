@@ -161,8 +161,13 @@ class Predictor:
     def predict(self, params, state, text, partial_chunk, mode):
         """Both sources always run, whichever owns the main slots (§7)."""
         ctx = analyse(text, partial_chunk, self.cfg.model.boundary_chars)
-        engine = self.engine_words(params, state, partial_chunk, ctx.engine_prefix)
-        graph = graph_words(self.graph, ctx.prev, ctx.word, 3)
+        if partial_chunk.strip() and not ctx.word:
+            # Right after punctuation ("hello.") neither source knows yet
+            # whether a sentence ended, so neither suggests.
+            engine, graph = [], []
+        else:
+            engine = self.engine_words(params, state, partial_chunk, ctx.engine_prefix)
+            graph = graph_words(self.graph, ctx.prev, ctx.word, 3)
         g = self.cfg.graph
         spike = bool(graph) and self.graph.is_spike(ctx.prev, graph[0][0].lower(), ctx.word, g.spike_prob, g.spike_min_count)
         slots = allocate(mode, engine, graph, spike, ctx.after_bracket)

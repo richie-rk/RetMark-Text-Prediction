@@ -105,12 +105,17 @@ class Tokenizer:
 
     def token_boundary_flags(self, text, ids, at_end):
         """Per token: does it contain a sentence boundary of `text`?"""
+        return self.flags_for_marks(text, ids, self.boundary_positions(text, at_end))
+
+    def flags_for_marks(self, text, ids, char_marks):
+        """Per token of `text`: does it cover one of the character indices in
+        `char_marks`? Works on bytes, since a token can split a character."""
         byte_pos = []
         offset = 0
         for c in text:
             byte_pos.append(offset)
             offset += len(c.encode("utf-8"))
-        marks = {byte_pos[i] for i in self.boundary_positions(text, at_end)}
+        marks = {byte_pos[i] for i in char_marks}
         flags = []
         start = 0
         for t in ids:
@@ -118,7 +123,6 @@ class Tokenizer:
             flags.append(any(start <= m < end for m in marks))
             start = end
         return flags
-
 
 def predict_words(tok, step, state, partial, word_prefix, top_k, max_tokens):
     """Engine word suggestions for the partial chunk (§4, token healing).
