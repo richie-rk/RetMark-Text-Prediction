@@ -9,6 +9,9 @@ from pk.tokenizer import boundary_positions, current_word, predict_words
 ENGINE = "ENGINE"
 GRAPH = "GRAPH"
 REDACTED = "[REDACTED"
+# Enough followers for every slot rule: three main slots plus a side slot,
+# after up to three duplicates of engine words are skipped.
+GRAPH_CANDIDATES = 7
 
 
 @dataclass(frozen=True)
@@ -167,7 +170,9 @@ class Predictor:
             engine, graph = [], []
         else:
             engine = self.engine_words(params, state, partial_chunk, ctx.engine_prefix)
-            graph = graph_words(self.graph, ctx.prev, ctx.word, 3)
+            # Beyond the top 3: the side slot takes the best follower not
+            # already in a main slot, which can be the 4th or later.
+            graph = graph_words(self.graph, ctx.prev, ctx.word, GRAPH_CANDIDATES)
         g = self.cfg.graph
         spike = bool(graph) and self.graph.is_spike(ctx.prev, graph[0][0].lower(), ctx.word, g.spike_prob, g.spike_min_count)
         slots = allocate(mode, engine, graph, spike, ctx.after_bracket)

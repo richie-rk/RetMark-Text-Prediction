@@ -1,6 +1,5 @@
 """Offline evaluation and parameter sweeps (§13). Nothing here writes to disk."""
 import functools
-import json
 import math
 from dataclasses import fields, replace
 from datetime import datetime
@@ -13,6 +12,7 @@ from pk import consolidate
 from pk.config import ConfigError, _validate
 from pk.engine.model import init_params
 from pk.engine.optim import Adam
+from pk.logs import parse_line
 from pk.session import OnlineTrainer
 from pk.tokenizer import Tokenizer
 
@@ -28,8 +28,8 @@ def load_sentences(path):
     offset = 0
     with open(path, "rb") as f:
         for line in f:
-            if line.strip():
-                r = json.loads(line)
+            r = parse_line(line) if line.strip() else None
+            if r is not None:
                 out.append(consolidate.Sentence(path.name, offset, r["session"], r["ts"], r["text"]))
             offset += len(line)
     return out

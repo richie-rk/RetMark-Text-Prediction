@@ -31,6 +31,7 @@ class LogWriter:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = None
+        self.error = None
         if background:
             self._thread = threading.Thread(target=self._run, daemon=True)
             self._thread.start()
@@ -54,17 +55,31 @@ class LogWriter:
             # The ts carries its own local date, so a line lands in the file
             # of the day it happened even if it is flushed after midnight.
             path = self.root / stream / f"{record['ts'][:10]}.jsonl"
-            by_file.setdefault(path, []).append(json.dumps(record, ensure_ascii=False))
-        for path, lines in by_file.items():
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with open(path, "a", encoding="utf-8", newline="\n") as f:
-                f.write("".join(line + "\n" for line in lines))
-                f.flush()
-                os.fsync(f.fileno())
+            by_file.setdefault(path, []).append((stream, record))
+        done = set()
+        try:
+            for path, items in by_file.items():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                # A crash can leave a torn last line; end it first so it cannot
+                # swallow the first line written now.
+                torn = path.exists() and path.stat().st_size > 0 and not _ends_with_newline(path)
+                with open(path, "a", encoding="utf-8", newline="\n") as f:
+                    f.write(("\n" if torn else "") + "".join(json.dumps(r, ensure_ascii=False) + "\n" for _, r in items))
+                    f.flush()
+                    os.fsync(f.fileno())
+                done.add(path)
+        except Exception:
+            # Keep unwritten lines for the next flush rather than lose them.
+            with self._lock:
+                self._pending[:0] = [item for path, items in by_file.items() if path not in done for item in items]
+            raise
 
     def _run(self):
         while not self._stop.wait(self.flush_interval_s):
-            self.flush()
+            try:
+                self.flush()
+            except Exception as e:  # retried next interval; shown in the toolbar
+                self.error = e
 
     def close(self):
         self._stop.set()
@@ -72,6 +87,23 @@ class LogWriter:
             self._thread.join()
             self._thread = None
         self.flush()
+
+
+def _ends_with_newline(path):
+    with open(path, "rb") as f:
+        f.seek(-1, os.SEEK_END)
+        return f.read(1) == b"\n"
+
+
+def parse_line(line):
+    """A clean-log record, or None for a line a crash left unreadable."""
+    try:
+        record = json.loads(line)
+    except ValueError:
+        return None
+    if not isinstance(record, dict) or not all(isinstance(record.get(k), str) for k in ("ts", "session", "text")):
+        return None
+    return record
 
 
 class SentenceEvents:
@@ -84,8 +116,17 @@ class SentenceEvents:
         self.events = []
         self.labels_seen = set()
 
-    def add(self, record):
-        self.events.append(record)
+    def add(self, record, tag=None):
+        # `tag` names the character a key event typed, so the event can follow
+        # that character if an edit moves it into a later sentence.
+        self.events.append((record, tag))
+
+    def split(self, later_tags):
+        """Move out the events whose characters now sit after this sentence."""
+        moved = SentenceEvents()
+        moved.events = [(r, t) for r, t in self.events if t is not None and t in later_tags]
+        self.events = [(r, t) for r, t in self.events if t is None or t not in later_tags]
+        return moved
 
     def observe(self, text):
         for _, _, label in redact.find(text):
@@ -98,7 +139,7 @@ class SentenceEvents:
             ordered = [l for l in redact.LABELS if l in labels]
             writer.queue("raw", writer.record("redacted_sentence", labels=ordered, text=redact.apply(final_text, spans)))
         else:
-            for record in self.events:
+            for record, _ in self.events:
                 writer.queue("raw", record)
         self.events = []
         self.labels_seen = set()
@@ -124,7 +165,8 @@ def pending_clean(data_dir, offsets):
         # A line without its newline is still being written: leave it for later.
         for line in data.split(b"\n")[:-1]:
             end = pos + len(line) + 1
-            if line.strip():
-                out.append((path.name, pos, end, json.loads(line)))
+            record = parse_line(line) if line.strip() else None
+            if record is not None:
+                out.append((path.name, pos, end, record))
             pos = end
     return out

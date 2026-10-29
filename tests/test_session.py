@@ -533,3 +533,49 @@ def test_tab_never_rewrites_text_before_the_floor(env):
     assert env.s.floor == len("It was a wo")
     env.s.backspace()
     assert env.s.text == "It was a wonderful"
+
+
+def test_paused_sentence_with_pii_writes_nothing(tmp_path, tok):
+    env = Env(tmp_path, tok, paused=True)
+    env.s.type("call me on 9876543210. ok")
+    env.s.close()
+    assert env.raw() == []
+
+
+def test_edit_that_splits_a_sentence_never_leaks_pii_keystrokes(env):
+    env.s.type("x 98765 4321Z0")
+    for _ in range(13):
+        env.s.left()
+    env.s.type(".")
+    env.s.right()
+    for _ in range(11):
+        env.s.right()
+    assert env.s.text[env.s.cursor - 1] == "Z"
+    env.s.backspace()
+    env.s.close()
+    assert env.s.text == "x. 98765 43210"
+    assert not any(c.isdigit() for c in keys_typed(env))
+
+
+def test_f2_removes_the_word_from_the_tally(tmp_path, tok):
+    env = Env(tmp_path, tok, misspelt={"koshy": ["kohl"]})
+    for _ in range(3):
+        env.s.type("koshy is here. ")
+    assert env.ws.tally.count("koshy") == 3
+    env.s.type("koshy ")
+    env.s.f2()
+    assert env.ws.tally.count("koshy") == 0
+    assert env.ws.tally.review(3) == []
+
+
+def test_prediction_cost_does_not_grow_with_the_session(env):
+    seen = []
+    original = env.s.predictor.predict
+
+    def spy(params, state, text, partial, mode):
+        seen.append(len(text))
+        return original(params, state, text, partial, mode)
+
+    env.s.predictor.predict = spy
+    env.s.type("one two three. " * 20)
+    assert max(seen[-15:]) < 40

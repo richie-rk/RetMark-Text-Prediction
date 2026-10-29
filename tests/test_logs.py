@@ -183,3 +183,36 @@ def test_pause_survives_restart(tmp_path):
     raw = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
     assert raw["paused"] is True
     assert "format_version" in raw
+
+
+def test_torn_last_line_is_terminated_and_skipped(tmp_path, writer):
+    from pk.logs import pending_clean
+
+    path = clean_file(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_text('{"ts": "2026-10-05T10:00:00.000+05:30", "session": "a", "source": "cli", "text": "good."}\n{"ts": "2026-10', encoding="utf-8")
+    writer.queue("clean", writer.clean_record(" next."))
+    writer.flush()
+    texts = [r["text"] for _, _, _, r in pending_clean(tmp_path, {})]
+    assert texts == ["good.", " next."]
+
+
+def test_flush_failure_keeps_lines_for_the_next_flush(tmp_path, writer, monkeypatch):
+    import builtins
+
+    real_open = builtins.open
+    calls = []
+
+    def failing_open(*a, **k):
+        if not calls:
+            calls.append(1)
+            raise OSError("disk full")
+        return real_open(*a, **k)
+
+    writer.queue("raw", writer.record("key", key="a"))
+    monkeypatch.setattr(builtins, "open", failing_open)
+    with pytest.raises(OSError):
+        writer.flush()
+    monkeypatch.setattr(builtins, "open", real_open)
+    writer.flush()
+    assert [l["key"] for l in lines(raw_file(tmp_path))] == ["a"]

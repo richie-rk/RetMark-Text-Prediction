@@ -208,3 +208,10 @@ def test_cleaning_with_real_harper(harper, tmp_path):
     d, t = make_tally(tmp_path)
     c = Corrector(harper, "both", d)
     assert clean_sentence("I saw thier car.", c, t, 3, 2, "ts") == "I saw their car."
+
+
+def test_emoji_sequences_never_break_checking(harper, tmp_path):
+    c = corrector(harper, tmp_path)
+    text = "😀😀 x 🇮🇳 I havv a cat."
+    issues = [i for i in c.check(text) if i.kind == "spelling"]
+    assert [text[i.start:i.end] for i in issues] == ["havv"]

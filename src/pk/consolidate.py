@@ -10,7 +10,7 @@ from pk.engine import layers
 from pk.engine.model import backward_sequence, forward_sequence
 from pk.engine.optim import clip_global_norm
 from pk.engine.state import zero_state
-from pk.logs import local_now, pending_clean
+from pk.logs import local_now, parse_line, pending_clean
 from pk.persistence import InstanceLock, Workspace, save_model, save_state
 from pk.tokenizer import Tokenizer
 from pk.xp import consolidation_backend
@@ -34,8 +34,8 @@ def load_archive(data_dir):
         offset = 0
         with open(path, "rb") as f:
             for line in f:
-                if line.strip():
-                    r = json.loads(line)
+                r = parse_line(line) if line.strip() else None
+                if r is not None:
                     out.append(Sentence(path.name, offset, r["session"], r["ts"], r["text"]))
                 offset += len(line)
     return out
@@ -97,7 +97,7 @@ def loss_and_grads(params, inputs, targets, flags, cfg, state0=None, with_grads=
     return float(loss_sum), len(inputs), grads, replace(final, logits=None), logits
 
 
-def evaluate(params, streams, cfg):
+def evaluate(params, streams, cfg, top3=True):
     """(summed CE, target count, top-3 token hits) over whole streams, each
     from zero state with the state carried across windows."""
     m = cfg.model
@@ -109,8 +109,11 @@ def evaluate(params, streams, cfg):
             loss, n, _, state, logits = loss_and_grads(params, inputs, targets, wflags, cfg, state, with_grads=False)
             total += loss
             count += n
-            top3 = xp.argsort(-logits, axis=-1)[:, :3]
-            hits += int((top3 == xp.asarray(targets)[:, None]).any(axis=-1).sum())
+            if top3:
+                # A target is in the top 3 when fewer than 3 logits beat it.
+                t = xp.asarray(targets)
+                target_logit = xp.take_along_axis(logits, t[:, None], axis=-1)
+                hits += int(((logits > target_logit).sum(axis=-1) < 3).sum())
     return total, count, hits
 
 
@@ -217,9 +220,9 @@ def run(cfg, today=None, clock=local_now):
         params = _to(xp, ws.params)
         adam = ws.adam
         adam.m, adam.v = _to(xp, adam.m), _to(xp, adam.v)
-        before, count, _ = evaluate(params, pending_streams, cfg)
+        before, count, _ = evaluate(params, pending_streams, cfg, top3=False)
         params = train(params, adam, train_streams, cfg, cfg.train.consolidation_lr, cfg.train.consolidation_epochs, rng)
-        after, _, _ = evaluate(params, pending_streams, cfg)
+        after, _, _ = evaluate(params, pending_streams, cfg, top3=False)
 
         ws.params = _host(params)
         adam.m, adam.v = _host(adam.m), _host(adam.v)

@@ -151,3 +151,23 @@ def test_predictor_runs_both_sources_on_the_real_engine():
     assert all(w.startswith("wor") for w in pred.engine_words)
     engine_mode = Predictor(tok, graph, cfg).predict(params, state, "hello wor", " wor", ENGINE)
     assert engine_mode.slots.primary.origin == "engine"
+
+
+def test_side_slot_uses_followers_beyond_the_top_three(monkeypatch):
+    from pathlib import Path
+
+    from pk.config import load_config
+    from pk.engine.state import zero_state
+    from pk.predictor import Predictor
+    from pk.tokenizer import Tokenizer
+
+    cfg = load_config(Path(__file__).resolve().parent.parent / "config.toml")
+    graph = WordGraph(BOUNDARY)
+    for w, n in (("cat", 4), ("dog", 3), ("fish", 2), ("bird", 1)):
+        for _ in range(n):
+            graph.update(f"the {w}.")
+    p = Predictor(Tokenizer(cfg.model.boundary_chars), graph, cfg)
+    monkeypatch.setattr(p, "engine_words", lambda *a: ["cat", "dog", "fish"])
+    pred = p.predict(None, zero_state(8), "the ", " ", ENGINE)
+    assert pred.slots.side == Suggestion("bird", "graph")
+    assert len(pred.graph_words) >= 4

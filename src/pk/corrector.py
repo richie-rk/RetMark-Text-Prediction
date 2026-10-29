@@ -35,6 +35,19 @@ def _utf16_position(text, index):
     return {"line": line, "character": col}
 
 
+def _char_index(text, position):
+    """Python string index of an LSP (line, UTF-16 column) position."""
+    line_start = 0
+    for _ in range(position["line"]):
+        line_start = text.index("\n", line_start) + 1
+    units = 0
+    i = line_start
+    while units < position["character"] and i < len(text):
+        units += 2 if ord(text[i]) > 0xFFFF else 1
+        i += 1
+    return i
+
+
 def _suggestion_text(flagged, suggestion):
     if "ReplaceWith" in suggestion:
         return "".join(suggestion["ReplaceWith"])
@@ -163,8 +176,23 @@ class HarperLS:
             raise HarperUnavailable(f"harper-ls error on {method}: {reply['error']}")
         return reply.get("result")
 
+    def _drain(self):
+        """Discard replies left over from a request that timed out, so a late
+        publishDiagnostics can never be read as the answer to a new check."""
+        while True:
+            try:
+                message = self._inbox.get_nowait()
+            except queue.Empty:
+                return
+            if message is None:
+                raise HarperUnavailable("harper-ls exited")
+            if "method" in message and "id" in message:
+                result = [self._settings()] if message["method"] == "workspace/configuration" else None
+                self._send({"jsonrpc": "2.0", "id": message["id"], "result": result})
+
     def lint(self, text, dialect):
         with self._lock:
+            self._drain()
             self._dialect = dialect
             uri, version = self._docs.get(dialect, (None, 0))
             if uri is None:
@@ -215,7 +243,13 @@ class HarperLS:
                 message=lint["message"],
                 suggestions=tuple(s for s in suggestions if s is not None),
             )
-        raise HarperUnavailable(f"no lint details for diagnostic {diagnostic}")
+        # harper-ls sometimes returns no code actions for a valid range (seen
+        # after some emoji sequences); the diagnostic alone still says what
+        # and where, just without suggestions.
+        start = _char_index(text, diagnostic["range"]["start"])
+        end = _char_index(text, diagnostic["range"]["end"])
+        code = str(diagnostic.get("code", ""))
+        return Lint(start, end, code, "Spelling" if code == "SpellCheck" else "", diagnostic["message"], ())
 
     def close(self):
         proc = getattr(self, "_proc", None)

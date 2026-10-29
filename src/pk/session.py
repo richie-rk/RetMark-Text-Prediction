@@ -36,12 +36,12 @@ class Recorder:
         self.paused = paused
         self._events = SentenceEvents()
 
-    def event(self, type, events=None, **fields):
+    def event(self, type, events=None, tag=None, **fields):
         if self.writer is not None and not self.paused:
-            (events or self._events).add(self.writer.record(type, **fields))
+            (events or self._events).add(self.writer.record(type, **fields), tag)
 
-    def key(self, char):
-        self.event("key", key=char)
+    def key(self, char, tag=None):
+        self.event("key", tag=tag, key=char)
 
     def special(self, name, events=None):
         self.event("special", events=events, key=name)
@@ -50,18 +50,22 @@ class Recorder:
         if not self.paused:
             self._events.observe(sentence_text)
 
-    def begin_next(self):
-        """Detach the current sentence's events and start a fresh buffer."""
-        events, self._events = self._events, SentenceEvents()
+    def begin_next(self, later_tags=frozenset()):
+        """Detach the current sentence's events and start a fresh buffer. Key
+        events for characters that now sit after the sentence (an edit moved
+        them) carry over, so the sentence they ended up in is the one whose
+        redaction check covers them."""
+        events = self._events
+        self._events = events.split(later_tags)
         return events
 
     def finish(self, events, raw_text, clean_text):
         """Close a sentence. Returns True if it is to be learned."""
-        if self.writer is None:
-            return not self.paused
-        events.finish(raw_text, self.writer)
         if self.paused:
-            return False
+            return False  # nothing typed while paused reaches a log
+        if self.writer is None:
+            return True
+        events.finish(raw_text, self.writer)
         if clean_text is not None:
             self.writer.queue("clean", self.writer.clean_record(clean_text))
         return True
@@ -84,7 +88,7 @@ class Recorder:
         return self.paused
 
     def close(self, unfinished_text):
-        if self.writer is not None:
+        if self.writer is not None and not self.paused:
             self._events.finish(unfinished_text, self.writer)
 
 
@@ -231,6 +235,8 @@ class LiveSession:
         self.handover = Handover.from_list(cfg.handover.window, ws.state.handover)
 
         self.text = ""
+        self.tags = []
+        self._next_tag = 0
         self.cursor = 0
         self.final_pos = 0
         self.line_start = 0
@@ -294,8 +300,9 @@ class LiveSession:
             if c == "\n":
                 self.enter()
                 continue
-            self._replace(self.cursor, self.cursor, c)
-            self.recorder.key(c)
+            self._next_tag += 1
+            self._replace(self.cursor, self.cursor, c, tag=self._next_tag)
+            self.recorder.key(c, tag=self._next_tag)
 
     def backspace(self):
         self.recorder.special("backspace")
@@ -359,7 +366,8 @@ class LiveSession:
         self.recorder.special("f2", events=events)
         if c is None:
             return
-        self.ws.dictionary.add(c.typed)
+        # Claiming a word also takes it out of the candidate tally.
+        self.ws.tally.approve([c.typed])
         self.recorder.event("dict_add", events=events, word=c.typed)
         self.correction = None
         self._refresh()
@@ -394,9 +402,10 @@ class LiveSession:
 
     # --- edits ------------------------------------------------------------
 
-    def _replace(self, start, end, new, newline=False):
+    def _replace(self, start, end, new, newline=False, tag=None):
         delta = len(new) - (end - start)
         self.text = self.text[:start] + new + self.text[end:]
+        self.tags[start:end] = [tag] * len(new)
         if self.cursor >= end:
             self.cursor += delta
         elif self.cursor > start:
@@ -506,12 +515,13 @@ class LiveSession:
             end = start + len(piece)
             if not committed or not marks or end <= self.sentence_start:
                 continue
+            later = {t for t in self.tags[end:] if t is not None}
             if self.waiting or self._blocked(self.sentence_start, end):
-                self.waiting.append((end, self.recorder.begin_next()))
+                self.waiting.append((end, self.recorder.begin_next(later)))
                 # Later text must never re-chunk into a waiting sentence.
                 self.breaks.append(end)
             else:
-                self._finalise(end, self.recorder.begin_next())
+                self._finalise(end, self.recorder.begin_next(later))
 
     def _release(self):
         while self.waiting and not self._blocked(self.final_pos, self.waiting[0][0]):
@@ -657,9 +667,19 @@ class LiveSession:
         return False
 
     def _predict(self):
-        T = self.text[: self.cursor]
+        # Only the editable region matters (the previous word is <s> across a
+        # finalised boundary), so the cost stays flat however long the session.
+        # A word straddling the region start is kept whole.
+        # The window reaches back over a word straddling the region start, the
+        # gap before it and the word before that, so prev is still right
+        # after a mid-sentence pause toggle.
+        start = self.final_pos
+        for word_part in (True, False, True):
+            while start > 0 and (WORD_RE.match(self.text, start - 1, start) is not None) == word_part:
+                start -= 1
+        T = self.text[start : self.cursor]
         self.prediction = self.predictor.predict(self.ws.params, self._live, T, self.partial, self.mode)
-        self._pred_len = len(T)
+        self._pred_len = self.cursor
 
     # --- inspection -------------------------------------------------------
 
