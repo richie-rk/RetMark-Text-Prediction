@@ -18,6 +18,27 @@ _WS_THEN_WORD_RE = regex.compile(r"\s+" + WORD_CHAR + "+")
 CLOSERS = frozenset("\"')]}’”»")
 
 
+def is_boundary_at(text, i, boundary_chars, at_end):
+    c = text[i]
+    if c not in boundary_chars:
+        return False
+    if c.isspace():
+        return True
+    if i + 1 == len(text):
+        return at_end
+    nxt = text[i + 1]
+    return nxt.isspace() or nxt in boundary_chars or nxt in CLOSERS
+
+
+def boundary_positions(text, boundary_chars, at_end):
+    """Indices of characters in `text` that end a sentence.
+
+    `at_end` says whether `text` is complete; when it is not, a mark at the
+    very end stays undecided (False) until the next character arrives.
+    """
+    return [i for i in range(len(text)) if is_boundary_at(text, i, boundary_chars, at_end)]
+
+
 def split_partial(chunks):
     if not chunks:
         return [], ""
@@ -79,19 +100,8 @@ class Tokenizer:
             hi = len(self._sorted_bytes)
         return self._sorted_ids[lo:hi]
 
-    def is_boundary_at(self, text, i, at_end):
-        c = text[i]
-        if c not in self.boundary_chars:
-            return False
-        if c.isspace():
-            return True
-        if i + 1 == len(text):
-            return at_end
-        nxt = text[i + 1]
-        return nxt.isspace() or nxt in self.boundary_chars or nxt in CLOSERS
-
     def boundary_positions(self, text, at_end):
-        return [i for i in range(len(text)) if self.is_boundary_at(text, i, at_end)]
+        return boundary_positions(text, self.boundary_chars, at_end)
 
     def token_boundary_flags(self, text, ids, at_end):
         """Per token: does it contain a sentence boundary of `text`?"""
