@@ -219,3 +219,42 @@ def test_review_dialog_drives_with_keys():
         inp.send_text(" \t\r")
         with create_app_session(input=inp, output=DummyOutput()):
             assert review_dialog([("richy", 3), ("teh", 3)]) == ["richy"]
+
+
+def run_main(monkeypatch, capsys, *args):
+    import sys
+
+    from pk.cli import main as cli_main
+
+    monkeypatch.setattr(sys, "argv", ["pk", *args])
+    with pytest.raises(SystemExit) as e:
+        cli_main.main()
+    return e.value.code, capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "args",
+    [["generate", "--json"], ["graph", "top", "--json"], ["generate", "--prompt", "x", "--tokens", "-1", "--temperature", "0", "--json"]],
+)
+def test_usage_errors_exit_1_with_one_json_object(project, monkeypatch, capsys, args):
+    code, out = run_main(monkeypatch, capsys, *args)
+    assert code == 1
+    lines = [l for l in out.splitlines() if l.strip()]
+    assert len(lines) == 1 and json.loads(lines[0])["ok"] is False
+
+
+def test_unexpected_errors_still_print_one_json_object(project):
+    (project / "data").mkdir()
+    (project / "data" / "state.json").write_text("{not json", encoding="utf-8")
+    result = pk("status", "--json")
+    assert result.exit_code == 1
+    assert one_json(result)["ok"] is False
+
+
+def test_eval_on_empty_or_malformed_holdout_is_an_error(project):
+    (project / "empty.jsonl").write_text("", encoding="utf-8")
+    result = pk("eval", "--holdout", "empty.jsonl", "--json")
+    assert result.exit_code == 1 and one_json(result)["ok"] is False
+    (project / "bad.jsonl").write_text('{"ts": "x"}\n', encoding="utf-8")
+    result = pk("eval", "--holdout", "bad.jsonl", "--json")
+    assert result.exit_code == 1 and one_json(result)["ok"] is False

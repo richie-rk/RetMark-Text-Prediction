@@ -40,7 +40,8 @@ def config():
 def emit(as_json, payload, human):
     """With --json print exactly one JSON object and nothing else."""
     if as_json:
-        sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        # allow_nan=False: NaN is not JSON; callers turn empty results into errors.
+        sys.stdout.write(json.dumps(payload, ensure_ascii=False, allow_nan=False) + "\n")
     else:
         typer.echo(human)
 
@@ -56,6 +57,9 @@ def run(as_json, fn):
         code, message = EXIT_LOCKED, f"{e}. Close pk live first."
     except (ModelMismatch, HarperUnavailable) as e:
         code, message = EXIT_ERROR, str(e)
+    except Exception as e:
+        # Whatever goes wrong, --json still prints exactly one JSON object.
+        code, message = EXIT_ERROR, f"{type(e).__name__}: {e}"
     if code != EXIT_OK:
         if as_json:
             sys.stdout.write(json.dumps({"ok": False, "error": message}, ensure_ascii=False) + "\n")
@@ -470,7 +474,10 @@ def _holdout(path):
 
     if not Path(path).exists():
         raise Fail(EXIT_ERROR, f"held-out file not found: {path}")
-    return evaluation.load_sentences(path)
+    sentences = evaluation.load_sentences(path)
+    if not sentences:
+        raise Fail(EXIT_ERROR, f"held-out file has no readable clean-log sentences: {path}")
+    return sentences
 
 
 @app.command("eval")
@@ -519,4 +526,22 @@ def sweep(param: str, values: str, holdout: Path = HOLDOUT, as_json: bool = JSON
 
 
 def main():
-    app()
+    """Entry point. Usage errors exit 1, not Click's 2, which pk keeps for
+    "lock held"; with --json they too print one JSON object."""
+    try:
+        from click.exceptions import ClickException
+    except ImportError:  # newer Typer vendors Click instead of depending on it
+        from typer._click.exceptions import ClickException
+
+    as_json = "--json" in sys.argv[1:]
+    try:
+        code = app(standalone_mode=False)
+    except typer.Abort:
+        code = EXIT_ERROR
+    except ClickException as e:
+        if as_json:
+            sys.stdout.write(json.dumps({"ok": False, "error": e.format_message()}, ensure_ascii=False) + "\n")
+        else:
+            e.show()
+        code = EXIT_ERROR
+    sys.exit(code or EXIT_OK)
