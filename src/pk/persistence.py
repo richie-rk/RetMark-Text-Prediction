@@ -234,12 +234,42 @@ class Workspace:
         tally = CandidateTally(data / "candidates.json", dictionary, rejected)
         return cls(cfg, params, adam, load_graph(data, m.boundary_chars), load_state(data), dictionary, rejected, tally)
 
-    def checkpoint(self, ts):
-        data = self.cfg.paths.data_dir
+    def capture(self, ts, lock=None):
+        """Copy everything a checkpoint needs, now, and return a function that
+        writes it. The copy is cheap and the writing slow, so the harness can
+        write from a background thread while typing carries on."""
+        from contextlib import nullcontext
+        from types import SimpleNamespace
+
+        with lock or nullcontext():
+            params = self.params
+            adam = SimpleNamespace(
+                m={k: v.copy() for k, v in self.adam.m.items()},
+                v={k: v.copy() for k, v in self.adam.v.items()},
+                step_count=self.adam.step_count,
+                half_lives=self.adam.half_lives,
+                tokens=self.adam.tokens,
+            )
         self.state.last_checkpoint = ts
-        save_model(data, self.params, self.adam)
-        save_graph(data, self.graph)
-        save_state(data, self.state)
-        self.dictionary.save()
-        self.rejected.save()
-        self.tally.save()
+        data = self.cfg.paths.data_dir
+        graph = json.dumps(
+            {"format_version": GRAPH_FORMAT_VERSION, "edges": self.graph.edges, "totals": self.graph.totals, "surface": self.graph.surface},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        state = State(self.state.paused, dict(self.state.offsets), list(self.state.handover), ts)
+        words = {d.path: "".join(w + "\n" for w in d).encode("utf-8") for d in (self.dictionary, self.rejected)}
+        tally = json.dumps(self.tally.entries, ensure_ascii=False).encode("utf-8")
+        tally_path = self.tally.path
+
+        def write():
+            save_model(data, params, adam)
+            atomic_write_bytes(data / "graph.json", graph)
+            save_state(data, state)
+            for path, payload in words.items():
+                atomic_write_bytes(path, payload)
+            atomic_write_bytes(tally_path, tally)
+
+        return write
+
+    def checkpoint(self, ts, lock=None):
+        self.capture(ts, lock)()

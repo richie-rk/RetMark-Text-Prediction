@@ -102,3 +102,29 @@ class SentenceEvents:
                 writer.queue("raw", record)
         self.events = []
         self.labels_seen = set()
+
+
+def clean_dir(data_dir):
+    return Path(data_dir) / "logs" / "clean"
+
+
+def pending_clean(data_dir, offsets):
+    """Complete clean-log lines past each file's consumed byte offset, today's
+    file included: [(file name, start offset, end offset, record)]."""
+    out = []
+    folder = clean_dir(data_dir)
+    if not folder.exists():
+        return out
+    for path in sorted(folder.glob("*.jsonl")):
+        offset = offsets.get(path.name, 0)
+        with open(path, "rb") as f:
+            f.seek(offset)
+            data = f.read()
+        pos = offset
+        # A line without its newline is still being written: leave it for later.
+        for line in data.split(b"\n")[:-1]:
+            end = pos + len(line) + 1
+            if line.strip():
+                out.append((path.name, pos, end, json.loads(line)))
+            pos = end
+    return out

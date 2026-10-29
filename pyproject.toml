@@ -12,6 +12,9 @@ dependencies = [
     "typer",
 ]
 
+[project.scripts]
+pk = "pk.cli.main:main"
+
 [project.optional-dependencies]
 gpu = ["cupy-cuda12x"]
 dev = ["pytest"]
