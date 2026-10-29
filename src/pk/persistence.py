@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,6 +23,11 @@ REPLACE_RETRIES = 20
 REPLACE_RETRY_S = 0.05
 
 
+# state.json is written from the harness thread (pause toggles) and the
+# checkpoint thread; one lock keeps a stale copy from landing last.
+STATE_LOCK = threading.RLock()
+
+
 class ModelMismatch(RuntimeError):
     pass
 
@@ -35,7 +41,9 @@ def atomic_write_bytes(path, data):
     so an interrupted write always leaves the previous file intact."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
+    # A per-writer temporary name: two threads saving the same file must not
+    # share one half-written temporary.
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     done = False
     try:
         with open(tmp, "wb") as f:
@@ -82,6 +90,11 @@ def load_state(data_dir):
 
 
 def save_state(data_dir, state):
+    with STATE_LOCK:
+        _write_state(data_dir, state)
+
+
+def _write_state(data_dir, state):
     atomic_write_json(
         Path(data_dir) / "state.json",
         {
@@ -256,7 +269,6 @@ class Workspace:
             {"format_version": GRAPH_FORMAT_VERSION, "edges": self.graph.edges, "totals": self.graph.totals, "surface": self.graph.surface},
             ensure_ascii=False,
         ).encode("utf-8")
-        state = State(self.state.paused, dict(self.state.offsets), list(self.state.handover), ts)
         words = {d.path: "".join(w + "\n" for w in d).encode("utf-8") for d in (self.dictionary, self.rejected)}
         tally = json.dumps(self.tally.entries, ensure_ascii=False).encode("utf-8")
         tally_path = self.tally.path
@@ -264,7 +276,11 @@ class Workspace:
         def write():
             save_model(data, params, adam)
             atomic_write_bytes(data / "graph.json", graph)
-            save_state(data, state)
+            with STATE_LOCK:
+                # Read the flags now, not at capture: a pause toggled while
+                # this was waiting to write must not be undone.
+                live = self.state
+                _write_state(data, State(live.paused, dict(live.offsets), list(live.handover), ts))
             for path, payload in words.items():
                 atomic_write_bytes(path, payload)
             atomic_write_bytes(tally_path, tally)

@@ -45,6 +45,8 @@ def toolbar_fragments(session):
     frags.append(("bold", f"{session.mode}"))
     frags.append(("", f"  engine {engine:.0%} · graph {graph:.0%}  ({n}/{window} words)   "))
     frags.append(PAUSED if session.paused else RECORDING)
+    if session.error is not None:
+        frags.append(("fg:ansired", f"   {session.error}"))
     trainer = session.trainer
     if trainer is not None and trainer.error is not None:
         frags.append(("fg:ansired", f"   online update failed: {trainer.error}"))
@@ -193,6 +195,7 @@ def run_live(cfg, inspect=False, echo=print):
     lock.acquire()
     harper = writer = trainer = session = None
     ws = None
+    completed = False
     try:
         tok = Tokenizer(cfg.model.boundary_chars)
         ws = Workspace.load(cfg, tok.vocab_size)
@@ -205,17 +208,29 @@ def run_live(cfg, inspect=False, echo=print):
         pending = len(pending_clean(cfg.paths.data_dir, ws.state.offsets))
         banner = f"Pending consolidation: {pending} sentences. Run pk consolidate after this session." if pending else ""
         Harness(session, cfg, ws, inspect, banner).run()
+        completed = True
         return 0
     finally:
-        # Ctrl+C and errors land here too: everything typed is kept.
+        # Ctrl+C and errors land here too: everything typed is kept, and each
+        # step runs even if an earlier one fails, so the lock is always freed.
+        errors = []
+
+        def attempt(fn):
+            try:
+                fn()
+            except Exception as e:
+                errors.append(e)
+
         if session is not None:
-            session.close()
+            attempt(session.close)
         if trainer is not None:
-            trainer.close()
+            attempt(trainer.close)
         if writer is not None:
-            writer.close()
+            attempt(writer.close)
         if ws is not None and session is not None:
-            ws.checkpoint(timestamp(local_now()), trainer.lock)
+            attempt(lambda: ws.checkpoint(timestamp(local_now()), trainer.lock))
         if harper is not None:
-            harper.close()
+            attempt(harper.close)
         lock.release()
+        if errors and completed:
+            raise errors[0]
