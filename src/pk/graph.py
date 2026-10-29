@@ -4,7 +4,7 @@ from pk.tokenizer import WORD_CHAR, boundary_positions
 
 START = "<s>"
 PLACEHOLDER = r"\[REDACTED-[A-Z]+\]"
-_ITEM_RE = regex.compile(f"({PLACEHOLDER})|{WORD_CHAR}+")
+ITEM_RE = regex.compile(f"({PLACEHOLDER})|{WORD_CHAR}+")
 
 
 class WordGraph:
@@ -31,7 +31,7 @@ class WordGraph:
     def update(self, sentence):
         for segment in self._segments(sentence):
             # A placeholder holds its word position (None) but is never a node.
-            items = [None if m.group(1) else m.group() for m in _ITEM_RE.finditer(segment)]
+            items = [None if m.group(1) else m.group() for m in ITEM_RE.finditer(segment)]
             for form in items:
                 if form is not None:
                     forms = self.surface.setdefault(form.lower(), {})
