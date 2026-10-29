@@ -284,6 +284,11 @@ class Corrector:
         issues.sort(key=lambda i: (i.start, i.end))
         return issues
 
+    def warm(self):
+        """harper-ls builds each dialect's linter on first use (~150 ms each);
+        doing that at startup keeps it off the first completed sentence."""
+        self.check("Warm up.")
+
     def is_valid(self, word):
         if word in self.dictionary:
             return True

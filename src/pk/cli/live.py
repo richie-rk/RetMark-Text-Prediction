@@ -198,6 +198,7 @@ def run_live(cfg, inspect=False, echo=print):
         ws = Workspace.load(cfg, tok.vocab_size)
         harper = HarperLS(cfg.correct.harper_ls_path)
         corrector = Corrector(harper, cfg.correct.dialect, ws.dictionary)
+        corrector.warm()
         writer = LogWriter(cfg.paths.data_dir, cfg.logs.flush_interval_s, str(uuid.uuid4()))
         trainer = OnlineTrainer(ws, tok, cfg)
         session = LiveSession(cfg, tok, ws, corrector, writer, trainer, async_checks=True)
