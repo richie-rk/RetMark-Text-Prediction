@@ -6,7 +6,8 @@ from dataclasses import dataclass, replace
 
 import numpy
 
-from pk.corrector import clean_sentence
+from pk import redact
+from pk.corrector import HarperUnavailable, clean_sentence
 from pk.engine import layers
 from pk.engine.model import backward_sequence, forward_sequence, step
 from pk.engine.optim import clip_global_norm
@@ -94,7 +95,7 @@ class OnlineTrainer:
     The Adam step writes new parameter arrays and swaps the workspace's
     reference in one assignment, so a prediction that took the old reference
     keeps a consistent model and never waits on a lock. `lock` only keeps a
-    checkpoint from saving Adam moments mid-update.
+    checkpoint from copying Adam moments mid-step.
     """
 
     def __init__(self, ws, tok, cfg, background=True):
@@ -150,21 +151,24 @@ class OnlineTrainer:
             ids += sentence_ids
             flags += sentence_flags
         started = time.perf_counter()
-        with self.lock:
-            params = self.ws.params
-            n = len(ids)
-            logits, final, cache = forward_sequence(params, numpy.asarray(ids), flags, self.train_state, m.fast_decay, m.boundary_decay)
-            if n > 1:
-                # One stream from the snapshot: every position with a successor
-                # in the batch has a target; gradients stop at sentence starts.
-                targets = numpy.asarray(ids[1:] + [0])
-                mask = numpy.arange(n) < n - 1
-                loss_sum, ce = layers.softmax_ce_forward(logits, targets, mask)
-                grads = backward_sequence(layers.softmax_ce_backward(ce) / (n - 1), cache, cuts)
-                grads, _ = clip_global_norm(grads, t.grad_clip)
+        params = self.ws.params
+        n = len(ids)
+        # Only this thread changes params, Adam and the training state, so the
+        # forward and backward passes need no lock; the lock covers the Adam
+        # step and the swap, which a checkpoint must never see half done.
+        logits, final, cache = forward_sequence(params, numpy.asarray(ids), flags, self.train_state, m.fast_decay, m.boundary_decay)
+        if n > 1:
+            # One stream from the snapshot: every position with a successor
+            # in the batch has a target; gradients stop at sentence starts.
+            targets = numpy.asarray(ids[1:] + [0])
+            mask = numpy.arange(n) < n - 1
+            loss_sum, ce = layers.softmax_ce_forward(logits, targets, mask)
+            grads = backward_sequence(layers.softmax_ce_backward(ce) / (n - 1), cache, cuts)
+            grads, _ = clip_global_norm(grads, t.grad_clip)
+            with self.lock:
                 self.ws.params = self.ws.adam.step(params, grads, t.online_lr, n - 1)
-                self.last_loss = float(loss_sum) / (n - 1)
-            self.train_state = replace(final, logits=None)
+            self.last_loss = float(loss_sum) / (n - 1)
+        self.train_state = replace(final, logits=None)
         self.last_duration_s = time.perf_counter() - started
 
     def wait(self):
@@ -236,14 +240,18 @@ class LiveSession:
         self.base_flag = False
         self.tail = deque(maxlen=INSPECT_TOKENS)
         self.snaps = []
-        self.pending = None
+        # Sentences whose boundary has committed but which wait on their
+        # correction slot (or a spell check still in flight): [(end, events)].
+        self.waiting = []
         self.carry = ""
         self.correction = None
         self.word_starts = {}
         self.committed = []
         self.recorded = set()
+        self.outstanding = []
         self.prediction = None
         self.partial = ""
+        self.error = None
         self._pred_len = 0
         self._live = self.base_state
 
@@ -266,11 +274,11 @@ class LiveSession:
 
     @property
     def floor(self):
-        return max(self.final_pos, self.pending[0] if self.pending else 0, self.line_start)
+        return max(self.final_pos, self.sentence_start, self.line_start)
 
     @property
     def sentence_start(self):
-        return self.pending[0] if self.pending else self.final_pos
+        return self.waiting[-1][0] if self.waiting else self.final_pos
 
     @property
     def boundary_fired(self):
@@ -288,13 +296,11 @@ class LiveSession:
                 continue
             self._replace(self.cursor, self.cursor, c)
             self.recorder.key(c)
-            self._observe()
 
     def backspace(self):
         self.recorder.special("backspace")
         if self.cursor > self.floor:
             self._replace(self.cursor - 1, self.cursor, "")
-            self._observe()
 
     def left(self):
         self.recorder.special("left")
@@ -310,54 +316,63 @@ class LiveSession:
 
     def enter(self):
         self.recorder.special("enter")
-        at = self.cursor
-        self.text = self.text[:at] + "\n" + self.text[at:]
-        self.cursor = at + 1
         # The newline commits at once and the finished line becomes read-only;
         # chunking restarts after it, so a following space cannot merge in.
-        self.breaks.append(self.cursor)
-        self.line_start = self.cursor
-        self._refresh()
+        self._replace(self.cursor, self.cursor, "\n", newline=True)
 
     def tab(self):
         primary = self.prediction.slots.primary if self.prediction else None
+        self.recorder.special("tab")
         if primary is None:
-            self.recorder.special("tab")
             self._replace(self.cursor, self.cursor, "\t")
             return
         word = self.prediction.context.word
-        self.recorder.special("tab")
         self.recorder.event("accept", slot="primary", origin=primary.origin, word=primary.word)
-        self._replace(self.cursor - len(word), self.cursor, primary.word + " ")
-        self._observe()
+        start = self.cursor - len(word)
+        # A word can straddle the floor (a pause toggle mid-word): text before
+        # the floor is final, so only the rest of the suggestion goes in.
+        cut = max(0, self.floor - start)
+        self._replace(start + cut, self.cursor, primary.word[cut:] + " ")
+
+    def _events_for(self, pos):
+        """The held events of the waiting sentence containing `pos`, if any."""
+        start = self.final_pos
+        for end, events in self.waiting:
+            if start <= pos < end:
+                return events
+            start = end
+        return None
 
     def insert(self):
         c = self.correction
-        events = self.pending[1] if self.pending and c and c.start < self.pending[0] else None
+        events = self._events_for(c.start) if c else None
         self.recorder.special("insert", events=events)
         if c is None:
             return
         self.recorder.event("correct", events=events, typed=c.typed, fixed=c.suggestion)
         self.correction = None
         self._replace(c.start, c.end, c.suggestion)
-        self._release_pending()
-        self._observe()
 
     def f2(self):
         c = self.correction
-        events = self.pending[1] if self.pending and c and c.start < self.pending[0] else None
+        events = self._events_for(c.start) if c else None
         self.recorder.special("f2", events=events)
         if c is None:
             return
         self.ws.dictionary.add(c.typed)
         self.recorder.event("dict_add", events=events, word=c.typed)
         self.correction = None
-        self._release_pending()
         self._refresh()
 
     def toggle_pause(self):
-        self._release_pending()
-        unfinished = self.text[self.final_pos:self.cursor]
+        """End everything typed so far, as one unit, before the flag flips:
+        waiting sentences finish in the state they were typed in, and the
+        rest (wherever the cursor is) is closed unlearned."""
+        self.correction = None
+        self.outstanding = []
+        self._release()
+        unfinished = self.text[self.final_pos:]
+        self.cursor = len(self.text)
         self._force_commit()
         self.recorder.toggle_pause(unfinished)
         self.ws.state.paused = self.recorder.paused
@@ -372,14 +387,14 @@ class LiveSession:
         self.cursor = len(self.text)
         self._refresh(at_end=True)
         self.correction = None
-        self._release_pending()
+        self.outstanding = []
         self._refresh(at_end=True)
         self.recorder.close(self.text[self.final_pos:])
         self.ws.state.handover = self.handover.to_list()
 
     # --- edits ------------------------------------------------------------
 
-    def _replace(self, start, end, new):
+    def _replace(self, start, end, new, newline=False):
         delta = len(new) - (end - start)
         self.text = self.text[:start] + new + self.text[end:]
         if self.cursor >= end:
@@ -388,24 +403,39 @@ class LiveSession:
             self.cursor = start + len(new)
         if delta:
             self._shift(start, end, delta)
+        if newline:
+            self.breaks.append(self.cursor)
+            self.line_start = self.cursor
         self._refresh()
 
     def _shift(self, start, end, delta):
-        def moved(p):
-            return p + delta if p >= end else p
+        """Move remembered positions after an edit of text[start:end].
 
-        self.committed = [(moved(s), w) for s, w in self.committed if not (start <= s < end) or s >= end]
-        self.word_starts = {moved(s): v for s, v in self.word_starts.items() if s >= end or s < start}
-        self.recorded = {moved(s) for s in self.recorded if s >= end or s < start}
-        self.breaks = [moved(b) for b in self.breaks]
-        if self.pending and self.pending[0] >= end:
-            self.pending = (self.pending[0] + delta, self.pending[1])
+        Markers that end something (a waiting sentence, a line, a chunk
+        break) move only when the edit lands strictly before them: text typed
+        exactly at a marker belongs after it. Items that start at an edited
+        replacement's start (a word being completed by Tab) keep their place.
+        """
+
+        def item(p):
+            return p + delta if p >= end and not (p == start and end > start) else p
+
+        def keep(p):
+            return p <= start or p >= end
+
+        def marker(p):
+            return p + delta if p > start else p
+
+        self.committed = [(item(s), w) for s, w in self.committed if keep(s)]
+        self.outstanding = [(item(s), w) for s, w in self.outstanding if keep(s)]
+        self.word_starts = {item(s): v for s, v in self.word_starts.items() if keep(s)}
+        self.recorded = {item(s) for s in self.recorded if keep(s)}
+        self.breaks = [marker(b) for b in self.breaks]
+        self.waiting = [(marker(e), ev) for e, ev in self.waiting]
+        self.line_start = marker(self.line_start)
         if self.correction and self.correction.start >= end:
             c = self.correction
             self.correction = replace(c, start=c.start + delta, end=c.end + delta)
-
-    def _observe(self):
-        self.recorder.observe(self.text[self.sentence_start:])
 
     # --- the core recomputation ------------------------------------------
 
@@ -449,50 +479,63 @@ class LiveSession:
         return state, partial
 
     def _refresh(self, at_end=False):
-        upto = self.cursor
-        chunks = self._chunks(upto, at_end)
+        # Redaction is checked on every edit against all unfinished text,
+        # after the cursor too: an edit can move typed characters into a
+        # different sentence than the one whose events hold their keystrokes.
+        self.recorder.observe(self.text[self.sentence_start:])
+        chunks = self._chunks(self.cursor, at_end)
         self._live, self.partial = self._advance(chunks)
-        self._complete_sentences(chunks)
-        if self.final_pos > 0 and any(c[0] < self.final_pos for c in chunks):
-            chunks = self._chunks(upto, at_end)
-            self._live, self.partial = self._advance(chunks)
         self._track_words()
+        moved = self.final_pos
+        self._complete_sentences(chunks)
         if self.correction and self.text[self.correction.start:self.correction.end] != self.correction.typed:
             self.correction = None
-            self._release_pending()
+        self._release()
+        if self.final_pos != moved:
+            self._live, self.partial = self._advance(self._chunks(self.cursor, at_end))
         self._predict()
+
+    def _blocked(self, start, end):
+        c = self.correction
+        if c is not None and start <= c.start < end:
+            return True
+        return any(start <= s < end for s, _ in self.outstanding)
 
     def _complete_sentences(self, chunks):
         for start, piece, committed, marks in chunks:
-            if not committed or not marks or start + len(piece) <= self.final_pos:
-                continue
-            if self.pending:
-                return
             end = start + len(piece)
-            c = self.correction
-            if c is not None and self.final_pos <= c.start < end:
-                self.pending = (end, self.recorder.begin_next())
-                return
-            self._finalise(end, self.recorder.begin_next())
+            if not committed or not marks or end <= self.sentence_start:
+                continue
+            if self.waiting or self._blocked(self.sentence_start, end):
+                self.waiting.append((end, self.recorder.begin_next()))
+                # Later text must never re-chunk into a waiting sentence.
+                self.breaks.append(end)
+            else:
+                self._finalise(end, self.recorder.begin_next())
 
-    def _release_pending(self):
-        if self.pending and self.correction is None:
-            end, events = self.pending
-            self.pending = None
+    def _release(self):
+        while self.waiting and not self._blocked(self.final_pos, self.waiting[0][0]):
+            end, events = self.waiting.pop(0)
             self._finalise(end, events)
 
     def _finalise(self, end, events):
         raw = self.text[self.final_pos:end]
         has_words = WORD_RE.search(raw) is not None
         if self.learn and has_words and not self.paused:
-            clean = clean_sentence(
-                self.carry + raw,
-                self.corrector,
-                self.ws.tally,
-                self.cfg.dictionary.candidate_min_count,
-                self.cfg.correct.max_edit_distance,
-                timestamp(self.clock()),
-            )
+            try:
+                clean = clean_sentence(
+                    self.carry + raw,
+                    self.corrector,
+                    self.ws.tally,
+                    self.cfg.dictionary.candidate_min_count,
+                    self.cfg.correct.max_edit_distance,
+                    timestamp(self.clock()),
+                )
+            except HarperUnavailable as e:
+                # Never lose typing to a checker failure: learn the sentence
+                # redacted but uncorrected, and say so in the toolbar.
+                self.error = f"spell check unavailable: {e}"
+                clean = redact.redact(self.carry + raw)[0]
             self.recorder.finish(events, raw, clean)
             self.ws.graph.update(clean)
             if self.trainer is not None:
@@ -517,6 +560,7 @@ class LiveSession:
         self.final_pos = end
         self.breaks = [b for b in self.breaks if b > end]
         self.committed = [(s, w) for s, w in self.committed if s >= end]
+        self.outstanding = [(s, w) for s, w in self.outstanding if s >= end]
         self.word_starts = {s: v for s, v in self.word_starts.items() if s >= end}
         self.recorded = {s for s in self.recorded if s >= end}
 
@@ -534,7 +578,6 @@ class LiveSession:
 
     def _track_words(self):
         T = self.text[: self.cursor]
-        # A word is committed once a non-word character follows it.
         old = self.prediction
         if old is not None and old.context.word == "" and self._pred_len < len(T):
             m = WORD_RE.match(T, self._pred_len)
@@ -543,8 +586,8 @@ class LiveSession:
                     [w.lower() for w in old.engine_words[:3]],
                     [w.lower() for w, _, _ in old.graph_words[:3]],
                 )
-        start = self.sentence_start
-        now = [(m.start(), m.group()) for m in WORD_RE.finditer(T, start) if m.end() < len(T)]
+        # A word is committed once a non-word character follows it.
+        now = [(m.start(), m.group()) for m in WORD_RE.finditer(T, self.final_pos) if m.end() < len(T)]
         new = [w for w in now if w not in self.committed]
         gone = [w for w in self.committed if w not in now]
         for s, _ in gone:
@@ -556,9 +599,8 @@ class LiveSession:
             self._on_word_commit(s, s + len(word), word)
 
     def _on_word_commit(self, start, end, word):
-        if self.correction is not None:
-            self.correction = None
-            self._release_pending()
+        # The correction slot clears when the next word is committed.
+        self.correction = None
         if self.learn and not self.paused and start in self.word_starts and start not in self.recorded:
             engine, graph = self.word_starts[start]
             self.handover.record(word.lower() in engine, word.lower() in graph)
@@ -566,9 +608,15 @@ class LiveSession:
         sentence_start = self.sentence_start
         job = (start, end, word, sentence_start, self.text[sentence_start:end])
         if self.async_checks:
+            self.outstanding.append((start, word))
             self._check_jobs.put(job)
         else:
-            self._apply_check(job, self.corrector.check(job[4]))
+            try:
+                issues = self.corrector.check(job[4])
+            except HarperUnavailable as e:
+                self.error = f"spell check unavailable: {e}"
+                issues = []
+            self._apply_check(job, issues)
 
     def _check_worker(self):
         while True:
@@ -586,8 +634,15 @@ class LiveSession:
             try:
                 job, issues = self._check_results.get_nowait()
             except queue.Empty:
-                return changed
+                break
+            start, _, word = job[:3]
+            if (start, word) in self.outstanding:
+                self.outstanding.remove((start, word))
             changed |= self._apply_check(job, issues)
+            changed = True
+        if changed:
+            self._refresh()
+        return changed
 
     def _apply_check(self, job, issues):
         start, end, word, sentence_start, _ = job

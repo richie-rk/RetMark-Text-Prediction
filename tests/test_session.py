@@ -349,3 +349,187 @@ def test_engine_mode_after_window(tmp_path, tok):
     env.s.type("hello ")
     assert env.s.mode == ENGINE
     assert env.s.prediction.slots.primary.origin == "engine"
+
+
+# --- regressions from review -------------------------------------------------
+
+
+def keys_typed(env):
+    return "".join(r["key"] for r in env.raw() if r["type"] == "key")
+
+
+def test_typing_at_a_waiting_sentence_end_starts_a_new_sentence(tmp_path, tok):
+    env = Env(tmp_path, tok, misspelt={"colr": ["color"]})
+    env.s.type("I like colr. ")
+    env.s.backspace()
+    env.s.type("Then we left. ")
+    assert env.learned == ["I like color.", "Then we left."]
+    env2 = Env(tmp_path / "b", tok, misspelt={"colr": ["color"]})
+    env2.s.type("I like colr. ")
+    env2.s.left()
+    env2.s.type("Ok")
+    env2.s.close()
+    assert "I like color.Ok" not in env2.learned
+    assert env2.learned[0] == "I like color."
+
+
+def test_enter_with_a_waiting_sentence_never_leaks_pii(tmp_path, tok):
+    env = Env(tmp_path, tok, misspelt={"colr": ["color"]})
+    env.s.type("I like colr.")
+    env.s.enter()
+    env.s.type("98765 ")
+    env.s.type("43210 ok. ")
+    env.s.close()
+    assert not any(c.isdigit() for c in keys_typed(env))
+    assert any(r["type"] == "redacted_sentence" for r in env.raw())
+
+
+def test_enter_mid_line_never_leaks_pii(env):
+    env.s.type("my pan isabcde1234f")
+    for _ in range(10):
+        env.s.left()
+    env.s.enter()
+    env.s.close()
+    assert "abcde1234f" not in keys_typed(env)
+    assert "1234" not in keys_typed(env)
+
+
+def test_pause_while_a_sentence_waits_finishes_it_first(tmp_path, tok):
+    env = Env(tmp_path, tok, misspelt={"colr": ["color"]})
+    env.s.type("I like colr. Mo")
+    env.s.toggle_pause()
+    assert env.learned == ["I like color."]
+    types = [r["type"] for r in env.raw()]
+    assert types[-1] == "pause"
+
+
+def test_waiting_sentence_from_pause_is_never_learned(tmp_path, tok):
+    env = Env(tmp_path, tok, misspelt={"colr": ["color"]}, paused=True)
+    env.s.type("I like colr. secr")
+    env.s.toggle_pause()
+    env.s.type("et and more. Second one. Third. ")
+    env.s.close()
+    assert not any("colr" in t or "color" in t or "secr" in t for t in env.learned)
+    assert env.learned == ["et and more.", " Second one.", " Third."]
+    # Nothing moved final_pos backwards into the paused text.
+    assert env.s.final_pos >= len("I like colr. secr")
+
+
+def test_paused_text_after_the_cursor_is_never_learned(tmp_path, tok):
+    env = Env(tmp_path, tok, paused=True)
+    env.s.type("private notes here")
+    for _ in range(10):
+        env.s.left()
+    env.s.toggle_pause()
+    for _ in range(10):
+        env.s.right()
+    env.s.type(". Ok. ")
+    env.s.close()
+    assert not any("notes" in t or "here" in t for t in env.learned)
+    assert "notes" not in env.ws.graph.surface
+
+
+def test_waiting_sentence_keeps_its_handover_records(tmp_path, tok):
+    env = Env(tmp_path, tok, misspelt={"colr": ["color"]})
+    env.s.type("I like colr. ")
+    assert len(env.s.handover.records) == 3
+
+
+@pytest.mark.parametrize("typed,fixed", [("colr", "color"), ("thiss", "this")])
+def test_insert_keeps_the_finished_line_read_only(tmp_path, tok, typed, fixed):
+    env = Env(tmp_path, tok, misspelt={typed: [fixed]})
+    env.s.type(f"I like {typed}.")
+    env.s.enter()
+    env.s.insert()
+    assert env.s.text == f"I like {fixed}.\n"
+    env.s.backspace()
+    assert env.s.text == f"I like {fixed}.\n"
+    env.s.type("ab")
+    env.s.backspace()
+    env.s.backspace()
+    assert env.s.text == f"I like {fixed}.\n"
+
+
+def test_last_word_before_enter_commits(tmp_path, tok):
+    env = Env(tmp_path, tok, misspelt={"colr": ["color"]})
+    env.s.type("I like colr")
+    env.s.enter()
+    assert env.s.correction is not None and env.s.correction.typed == "colr"
+    assert len(env.s.handover.records) == 3
+
+
+def test_tab_after_a_typed_partial_records_handover(env):
+    env.ws.graph.update("hello world.")
+    env.restart()
+    env.s.type("hello wo")
+    env.s.tab()
+    assert env.s.text == "hello world "
+    assert len(env.s.handover.records) == 2
+    assert env.s.handover.records[-1] == (False, True)
+
+
+def test_sentence_waits_for_an_outstanding_async_check(tmp_path, tok):
+    import time
+
+    env = Env(tmp_path, tok, misspelt={"colr": ["color"]})
+    env.s = LiveSession(env.cfg, tok, env.ws, env.corrector, env.writer, env.trainer, clock=env.clock, async_checks=True)
+    env.s.type("I like colr.")
+    env.s.type(" ")
+    assert env.learned == []
+    deadline = time.time() + 5
+    while env.s.correction is None and time.time() < deadline:
+        env.s.poll()
+        time.sleep(0.01)
+    assert env.s.correction is not None and env.s.correction.typed == "colr"
+    assert env.learned == []
+    env.s.insert()
+    # The corrected word is re-checked like any commit; once that check
+    # comes back clean the sentence completes.
+    deadline = time.time() + 5
+    while not env.learned and time.time() < deadline:
+        env.s.poll()
+        time.sleep(0.01)
+    assert env.learned == ["I like color."]
+
+
+def test_async_clean_word_releases_the_sentence(tmp_path, tok):
+    import time
+
+    env = Env(tmp_path, tok)
+    env.s = LiveSession(env.cfg, tok, env.ws, env.corrector, env.writer, env.trainer, clock=env.clock, async_checks=True)
+    env.s.type("I like it. ")
+    deadline = time.time() + 5
+    while not env.learned and time.time() < deadline:
+        env.s.poll()
+        time.sleep(0.01)
+    assert env.learned == ["I like it."]
+
+
+def test_harper_failure_during_cleaning_does_not_crash_typing(tmp_path, tok):
+    from pk.corrector import HarperUnavailable
+
+    env = Env(tmp_path, tok)
+
+    def broken(text):
+        raise HarperUnavailable("gone")
+
+    env.s.type("hello there")
+    env.corrector.check = broken
+    env.s.type(". Next ")
+    assert env.learned == ["hello there."]
+    assert env.s.error is not None
+
+
+def test_tab_never_rewrites_text_before_the_floor(env):
+    env.ws.graph.update("It was a wonderful day.")
+    env.restart()
+    env.s.type("It was a wo")
+    env.s.toggle_pause()
+    env.s.type("n")
+    floor_text = env.s.text[: env.s.floor]
+    env.s.tab()
+    assert env.s.text.startswith(floor_text)
+    assert env.s.text == "It was a wonderful "
+    assert env.s.floor == len("It was a wo")
+    env.s.backspace()
+    assert env.s.text == "It was a wonderful"
