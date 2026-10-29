@@ -7,6 +7,8 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 
+from pk import redact
+
 # Not tunables: how long to wait on a process that has stopped answering.
 STARTUP_TIMEOUT_S = 30.0
 REQUEST_TIMEOUT_S = 10.0
@@ -227,3 +229,125 @@ class HarperLS:
                 proc.kill()
                 proc.wait()
         shutil.rmtree(self._tmp, ignore_errors=True)
+
+
+DIALECT_NAMES = {"american": ("American",), "british": ("British",), "both": ("American", "British")}
+SPELL_RULE = "SpellCheck"
+
+
+@dataclass(frozen=True)
+class Issue:
+    start: int
+    end: int
+    kind: str
+    rule: str
+    message: str
+    suggestions: tuple[str, ...]
+    word: str
+
+
+def _merge_suggestions(lists):
+    out = []
+    seen = set()
+    for suggestions in lists:
+        for s in suggestions:
+            if s.lower() not in seen:
+                seen.add(s.lower())
+                out.append(s)
+    return tuple(out)
+
+
+class Corrector:
+    """Harper decides what is wrong. "spelling" means Harper's SpellCheck
+    rule, which flags one word missing from the dictionary; every other lint
+    is "grammar". With dialect "both" an issue must appear in both runs, so
+    a word correct in either spelling is accepted."""
+
+    def __init__(self, harper, dialect, dictionary):
+        self.harper = harper
+        self.dialects = DIALECT_NAMES[dialect]
+        self.dictionary = dictionary
+
+    def check(self, text):
+        runs = [self.harper.lint(text, d) for d in self.dialects]
+        keyed = [{(l.start, l.end, l.rule): l for l in run} for run in runs]
+        issues = []
+        for key, first in keyed[0].items():
+            if not all(key in k for k in keyed[1:]):
+                continue
+            word = text[first.start:first.end]
+            kind = "spelling" if first.rule == SPELL_RULE else "grammar"
+            if kind == "spelling" and word in self.dictionary:
+                continue
+            suggestions = _merge_suggestions(k[key].suggestions for k in keyed)
+            issues.append(Issue(first.start, first.end, kind, first.rule, first.message, suggestions, word))
+        issues.sort(key=lambda i: (i.start, i.end))
+        return issues
+
+    def is_valid(self, word):
+        if word in self.dictionary:
+            return True
+        return not any(i.kind == "spelling" for i in self.check(word))
+
+
+def damerau_levenshtein(a, b):
+    """Unrestricted Damerau-Levenshtein distance, case-insensitive."""
+    a, b = a.lower(), b.lower()
+    inf = len(a) + len(b)
+    last_row = {}
+    d = [[inf] * (len(b) + 2) for _ in range(len(a) + 2)]
+    for i in range(len(a) + 1):
+        d[i + 1][0] = inf
+        d[i + 1][1] = i
+    for j in range(len(b) + 1):
+        d[0][j + 1] = inf
+        d[1][j + 1] = j
+    for i in range(1, len(a) + 1):
+        last_match_col = 0
+        for j in range(1, len(b) + 1):
+            i1 = last_row.get(b[j - 1], 0)
+            j1 = last_match_col
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            if cost == 0:
+                last_match_col = j
+            d[i + 1][j + 1] = min(
+                d[i][j] + cost,
+                d[i + 1][j] + 1,
+                d[i][j + 1] + 1,
+                d[i1][j1] + (i - i1 - 1) + 1 + (j - j1 - 1),
+            )
+        last_row[a[i - 1]] = i
+    return d[len(a) + 1][len(b) + 1]
+
+
+def clean_sentence(text, corrector, tally, candidate_min_count, max_edit_distance, ts):
+    """Count this sentence's flagged words, then return its cleaned and
+    redacted text (§8, §9). Redaction spans come from the raw sentence; an
+    issue touching one is neither counted nor corrected, and placeholders go
+    in last so a correction can never resurrect what was redacted."""
+    spans = redact.find(text)
+
+    def redacted(i):
+        return any(i.start < e and s < i.end for s, e, _ in spans)
+
+    issues = [i for i in corrector.check(text) if i.kind == "spelling" and not redacted(i)]
+    for i in issues:
+        tally.increment(i.word, ts)
+
+    edits = [(s, e, redact.placeholder(label)) for s, e, label in spans]
+    for i in issues:
+        if i.word in tally.dictionary:
+            continue
+        if tally.count(i.word) >= candidate_min_count:
+            continue
+        if i.suggestions and damerau_levenshtein(i.word, i.suggestions[0]) <= max_edit_distance:
+            edits.append((i.start, i.end, i.suggestions[0]))
+    edits.sort()
+    out = []
+    pos = 0
+    for s, e, replacement in edits:
+        out.append(text[pos:s])
+        out.append(replacement)
+        pos = e
+    out.append(text[pos:])
+    return "".join(out)
